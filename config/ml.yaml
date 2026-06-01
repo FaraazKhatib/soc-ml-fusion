@@ -1,0 +1,23 @@
+org: iitb
+dept: trustlab
+
+input:
+  directory: /var/log/soc_output
+  services:
+    - roundcube   
+    - postfix
+    - waf
+    - web_access
+
+processing:
+  batch_seconds: 10
+  state_save_seconds: 300
+
+anomaly:
+  algorithm: isolation_forest
+  contamination: auto
+
+output:
+  alerts_file: /opt/TLSOC-ML/output/alerts.json
+
+debug: true

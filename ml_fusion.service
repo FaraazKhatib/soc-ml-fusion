@@ -1,0 +1,17 @@
+[Unit]
+Description=ML Fusion Detection Service
+After=network.target
+
+[Service]
+Type=simple
+User=fusion
+WorkingDirectory=/home/fusion/TLSOC-ML
+ExecStart=/usr/bin/python3 /home/fusion/TLSOC-ML/ml_fusion.py
+Restart=always
+RestartSec=5
+
+StandardOutput=append:/home/fusion/TLSOC-ML/output/ml-fusion.log
+StandardError=append:/home/fusion/TLSOC-ML/output/ml-fusion-error.log
+
+[Install]
+WantedBy=multi-user.target
