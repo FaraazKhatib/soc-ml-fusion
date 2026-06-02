@@ -28,17 +28,33 @@ Uses IsolationForest to learn normal login failure patterns and flags anomalies 
 
 ### 2. Set your log file path
 
-Open `ml_fusion.py` and change line 20:
+Open ml_fusion.py and change line 20:
 
     # CHANGE THIS to your actual log file path
     AUTH_LOG_FILE = "/var/log/soc_output/mail_auth.json"
 
-That is the **only change** you need to make.
+That is the only change you need to make.
 
 ### 3. Run
 
     chmod +x run.sh
     ./run.sh
+
+---
+
+## Recommended — Run in an isolated environment
+
+If you are on a shared server or don't have sudo access, use a Python virtual environment:
+
+    python3 -m venv freshenv
+    source freshenv/bin/activate
+    chmod +x run.sh
+    ./run.sh
+
+This installs all dependencies in isolation without touching system packages.
+To exit the virtual environment when done:
+
+    deactivate
 
 ---
 

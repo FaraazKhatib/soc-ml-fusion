@@ -16,3 +16,6 @@ alerts.json
 alerts/
 state/
 baselines/
+freshenv/
+venv/
+*.env
