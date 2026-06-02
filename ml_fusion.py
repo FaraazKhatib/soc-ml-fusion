@@ -41,9 +41,11 @@ failed_login_tracker = defaultdict(deque)
 long_failed_login_tracker = defaultdict(deque)
 
 last_attempt_event_time = {}
+last_source_activity = {}
 
 source_user_tracker = defaultdict(deque)
 attack_start_time = {}
+recent_attack_activity = {}
 
 source_attack_tracker = defaultdict(deque)
 source_burst_tracker = defaultdict(deque)
@@ -112,6 +114,23 @@ def cleanup_tuple_deque(deq, now, window):
     while deq and deq[0][1] < now - window:
         deq.popleft()
 
+def cleanup_recent_attacks(now):
+
+    expired = []
+
+    for user, data in recent_attack_activity.items():
+
+        delta = (
+            now -
+            data["timestamp"]
+        ).total_seconds()
+
+        if delta > 3600:
+            expired.append(user)
+
+    for user in expired:
+        del recent_attack_activity[user]
+
 
 # =====================================================
 # NORMALIZE
@@ -127,14 +146,18 @@ def normalize_log(log):
         event.get("original", "")
     ).lower()
 
+    invalid_user = (
+        "invalid user" in message
+    )
+
     return {
         "timestamp": extract_real_event_timestamp(log),
         "user": user.get("name", "unknown"),
         "host": observer.get("source_host", "unknown"),
         "source_ip": source.get("ip", "unknown"),
-        "raw_message": message
+        "raw_message": message,
+        "invalid_user": invalid_user
     }
-
 
 # =====================================================
 # AUTH FAILURE FILTER
@@ -147,6 +170,43 @@ def is_auth_failure(log):
         "authentication failure" in msg or
         "invalid user" in msg
     )
+
+
+#Authentication sucesses#
+
+def is_auth_success(log):
+    msg = log["raw_message"]
+
+    return (
+        "accepted password" in msg or
+        "authentication succeeded" in msg or
+        "login successful" in msg
+    )
+
+def detect_success_after_bruteforce(log):
+
+    user = log["user"]
+
+    if user not in recent_attack_activity:
+        return None
+
+    attack = recent_attack_activity[user]
+
+    delta = (
+        log["timestamp"] -
+        attack["timestamp"]
+    ).total_seconds()
+
+    if delta > 3600:
+        return None
+
+    if attack["failed_attempts"] < 3:
+        return None
+
+    if attack["source_ip"] != log["source_ip"]:
+        return None
+
+    return attack
 
 
 # =====================================================
@@ -300,7 +360,21 @@ def extract_features(log):
     # Persistence
     # -------------------------------------------
     if source_ip not in attack_start_time:
+
         attack_start_time[source_ip] = now
+
+    else:
+
+        inactivity = (
+                now -
+            last_source_activity[source_ip]
+        ).total_seconds()
+
+        if inactivity > 1800:
+
+            attack_start_time[source_ip] = now
+
+    last_source_activity[source_ip] = now
 
     persistence_minutes = round(
         (
@@ -311,7 +385,7 @@ def extract_features(log):
     )
 
     return {
-        "failed_attempts": failed_attempts,
+         "failed_attempts": failed_attempts,
         "pair_failed_attempts": pair_failed_attempts,
         "user_failed_attempts": user_failed_attempts,
         "ip_failed_attempts": ip_failed_attempts,
@@ -324,7 +398,9 @@ def extract_features(log):
         "source_burst_attempts": source_burst_attempts,
         "unique_users_targeted": unique_users_targeted,
         "persistence_minutes": persistence_minutes,
-        "account_risk": get_account_risk(user)
+        "account_risk": get_account_risk(user),
+
+        "user_validity": 0 if log["invalid_user"] else 1
     }
 
 
@@ -341,7 +417,8 @@ def features_to_vector(features):
         features["source_burst_attempts"],
         features["unique_users_targeted"],
         features["persistence_minutes"],
-        features["account_risk"]
+        features["account_risk"],
+        features["user_validity"]
     ]]
 
 
@@ -366,7 +443,7 @@ def calculate_risk_score(features):
         reasons.append("persistent_failures")
 
     if features["seconds_since_last_attempt"] < FAST_RETRY_THRESHOLD:
-        score += 15
+        score += 8
         reasons.append("fast_retries")
 
     if features["source_attempt_rate"] >= HIGH_ATTEMPT_RATE_THRESHOLD:
@@ -385,7 +462,26 @@ def calculate_risk_score(features):
         score += 10
         reasons.append("persistent_attack")
 
+    if features["user_validity"] == 1:
+
+        if features["failed_attempts"] >= 20:
+            score += 25
+            reasons.append("valid_account_targeted")
+
+        elif features["failed_attempts"] >= 10:
+            score += 15
+            reasons.append("valid_account_targeted")
+
+        elif features["failed_attempts"] >= 4:
+            score += 5
+            reasons.append("valid_account_targeted")
+        else:
+            score -= 15
+            reasons.append("invalid_account_targeted")
+
     score += features["account_risk"] * 5
+
+    score = max(score, 0)
 
     return min(score, 100), reasons
 
@@ -524,6 +620,33 @@ def train_model():
 def process_log(raw_log):
     log = normalize_log(raw_log)
 
+    if is_auth_success(log):
+
+        attack = detect_success_after_bruteforce(log)
+
+        if attack:
+
+            timestamp = datetime.now(
+                timezone.utc
+            ).strftime(
+                "%Y-%m-%d %H:%M:%S UTC"
+            )
+
+            log_print(
+                f"[{timestamp}] "
+                f"[COMPROMISED_ACCOUNT] "
+                f"severity=CRITICAL "
+                f"user={log['user']} "
+                f"source_ip={log['source_ip']} "
+                f"target_host={log['host']} "
+                f"risk=100 "
+                f"previous_risk={attack['risk']} "
+                f"failed_attempts={attack['failed_attempts']} "
+                f"reason=successful_login_after_bruteforce"
+            )
+
+        return
+
     if not is_auth_failure(log):
         return
 
@@ -546,6 +669,16 @@ def process_log(raw_log):
         reasons.append("ml_anomaly_detected")
 
     severity = classify_attack(risk_score)
+
+    if severity != "NORMAL":
+
+        recent_attack_activity[log["user"]] = {
+            "timestamp": log["timestamp"],
+            "source_ip": log["source_ip"],
+            "failed_attempts": features["failed_attempts"],
+            "risk": risk_score,
+            "severity": severity
+        }
 
     timestamp = datetime.now(
         timezone.utc

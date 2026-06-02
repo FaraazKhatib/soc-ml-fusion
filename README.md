@@ -16,6 +16,8 @@ Uses IsolationForest to learn normal login failure patterns and flags anomalies 
 | Automated attacks | Sub-second retry speed, burst patterns |
 | Slow and low attacks | Long-window 60 min failure accumulation |
 | Persistent attacks | Attack duration tracking |
+| Valid account targeting | Higher risk if targeted account actually exists |
+| Compromised account | Successful login detected after brute force activity |
 
 ---
 
@@ -44,14 +46,13 @@ That is the only change you need to make.
 
 ## Recommended — Run in an isolated environment
 
-If you are on a shared server or don't have sudo access, use a Python virtual environment:
+If you are on a shared server or do not have sudo access, use a Python virtual environment:
 
     python3 -m venv freshenv
     source freshenv/bin/activate
     chmod +x run.sh
     ./run.sh
 
-This installs all dependencies in isolation without touching system packages.
 To exit the virtual environment when done:
 
     deactivate
@@ -88,9 +89,83 @@ To exit the virtual environment when done:
 
 ## Output format
 
+### Brute force alert
+
     [2026-05-29 10:03:31 UTC] [AUTOMATED_BRUTE_FORCE] severity=CRITICAL user=root
     source_ip=10.8.0.30 target_host=mail risk=100
-    reasons=['burst_attack', 'ml_anomaly_detected'] features={...}
+    reasons=['burst_attack', 'valid_account_targeted', 'ml_anomaly_detected']
+    features={...}
+
+### Compromised account alert
+
+    [2026-05-29 10:15:44 UTC] [COMPROMISED_ACCOUNT] severity=CRITICAL user=root
+    source_ip=10.8.0.30 target_host=mail risk=100 previous_risk=85
+    failed_attempts=12 reason=successful_login_after_bruteforce
+
+---
+
+## Feature set (9 features fed into the ML model)
+
+| Feature | What it measures |
+|---|---|
+| failed_attempts | Max failures across pair, user, and IP in last 5 min |
+| long_failed_attempts | Max failures across pair, user, and IP in last 60 min |
+| seconds_since_last_attempt | Time since last attempt from this IP and user |
+| source_attempt_rate | Attempts per minute from this IP |
+| source_burst_attempts | Attempts from this IP within last 1 second |
+| unique_users_targeted | Distinct usernames tried from this IP in 5 min |
+| persistence_minutes | How long this attack has been running |
+| account_risk | root=5, admin=4, mysql/postgres=3, others=1 |
+| user_validity | 1 if account exists, 0 if invalid user |
+
+---
+
+## New in this version
+
+### Valid vs Invalid user classification
+
+When a log contains "invalid user" it means the attacker is guessing usernames that do not exist.
+When the username actually exists on the system ("failed password"), the risk score increases significantly
+because the attacker has found a real target.
+
+    invalid user attempt  → risk reduced  (just scanning, not targeted)
+    valid user, few fails → small boost
+    valid user, 10+ fails → +15 points
+    valid user, 20+ fails → +25 points
+
+### Successful login after brute force detection
+
+When a successful authentication is detected from an IP that was previously flagged for brute force
+activity against the same user within the last hour, a COMPROMISED_ACCOUNT alert fires immediately
+with severity CRITICAL regardless of anything else.
+
+This is the most dangerous scenario — the attack succeeded.
+
+---
+
+## How the detection pipeline works
+
+    New log arrives
+         |
+    is_auth_success? --> YES --> was this user under attack in last hour?
+         |                              |
+         |                    YES --> COMPROMISED_ACCOUNT alert
+         |
+    is_auth_failure? --> NO --> skip
+         |
+    extract 9 features
+         |
+    IsolationForest predict --> normal or anomaly?
+         |
+    calculate_risk_score() --> 0 to 100 + reasons list
+         |
+    if ML anomaly and 3+ failures --> risk += 20
+         |
+    classify severity
+         |
+    detect automation --> MANUAL or AUTOMATED
+         |
+    print alert
 
 ---
 
