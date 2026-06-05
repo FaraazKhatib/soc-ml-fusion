@@ -2,7 +2,8 @@
 **IITB Trust Lab — Summer of Code 2026**
 
 Real-time ML-based brute force detection engine for mail authentication logs.
-Uses IsolationForest to learn normal login failure patterns and flags anomalies as they happen.
+Uses two IsolationForest models (IP-level + User-level) to detect attacks that
+a single model cannot catch individually.
 
 ---
 
@@ -11,13 +12,12 @@ Uses IsolationForest to learn normal login failure patterns and flags anomalies 
 | Attack Type | How |
 |---|---|
 | Brute force (single IP) | High failed attempts in short window |
-| Distributed brute force | Same username attacked from multiple IPs |
-| Password spraying | One IP targeting many different usernames |
-| Automated attacks | Sub-second retry speed, burst patterns |
+| Password spray | One IP targeting many different usernames |
+| Credential stuffing | One IP, many users, automated tool |
+| Distributed attack | Multiple IPs coordinating against same user |
+| Automated botnet | 5+ IPs targeting same user simultaneously |
+| Successful compromise | Login after brute force activity |
 | Slow and low attacks | Long-window 60 min failure accumulation |
-| Persistent attacks | Attack duration tracking |
-| Valid account targeting | Higher risk if targeted account actually exists |
-| Compromised account | Successful login detected after brute force activity |
 
 ---
 
@@ -32,8 +32,7 @@ Uses IsolationForest to learn normal login failure patterns and flags anomalies 
 
 Open ml_fusion.py and change line 20:
 
-    # CHANGE THIS to your actual log file path
-    AUTH_LOG_FILE = "/var/log/soc_output/mail_auth.json"
+    AUTH_LOG_FILE = "/your/path/to/auth_logs.json"
 
 That is the only change you need to make.
 
@@ -46,14 +45,12 @@ That is the only change you need to make.
 
 ## Recommended — Run in an isolated environment
 
-If you are on a shared server or do not have sudo access, use a Python virtual environment:
-
     python3 -m venv freshenv
     source freshenv/bin/activate
     chmod +x run.sh
     ./run.sh
 
-To exit the virtual environment when done:
+To exit:
 
     deactivate
 
@@ -66,106 +63,79 @@ To exit the virtual environment when done:
 
 ---
 
+## How it works
+
+Two IsolationForest models run in parallel:
+
+    IP Model   — learns normal behavior per source IP
+                 catches brute force, spray, credential stuffing
+
+    User Model — learns normal behavior per target user
+                 catches distributed attacks where each IP
+                 looks innocent individually but the combined
+                 pressure on one user is anomalous
+
+Final score = max(ip_score, user_score)
+The worst-case perspective always wins.
+
+---
+
+## Alert format
+
+    [2026-06-04 06:04:08 UTC] [CRITICAL] [AUTOMATED]
+      Who:    10.8.10.20 -> root on mail
+      What:   5 different IPs are all targeting the 'root' account.
+              Each IP makes only a few attempts to stay under the radar,
+              but together they have made 12 failed login attempts.
+              This looks like a coordinated botnet.
+      Score:  0.87/1.00  (ip model: 0.61, user model: 0.87)
+      Tags:   automated_distributed
+      All IPs targeting 'root': 10.8.10.10, 10.8.10.20, 10.8.10.30
+
+---
+
+## Identity key logic
+
+Each alert is deduplicated by an identity key:
+
+    3+ IPs targeting same user  ->  DISTRIBUTED:{user}  (consolidated)
+    Single IP attack            ->  {source_ip}         (per IP)
+
+This means a 10-IP botnet fires ONE alert, not 10 noisy ones.
+
+---
+
+## Automation detection — 3 paths
+
+    CV consistency    — same IP fires at perfectly regular intervals
+                        works for Hydra --wait N regardless of speed
+
+    Speed signals     — sub-second gaps, high rate, or burst in 1 second
+                        catches fast single-IP tools
+
+    Distributed botnet — 5+ IPs coordinating against same user
+                         catches botnets where no single IP looks fast
+
+---
+
 ## Requirements
 
 - Python 3.8 or higher
-- Log file in newline-delimited JSON format (one JSON object per line)
+- Log file in newline-delimited JSON format
 
 ---
 
 ## Expected log format
 
     {
-      "@timestamp": "2026-05-29T10:03:31Z",
+      "@timestamp": "2026-06-04T06:04:08Z",
       "event": {
-        "original": "May 29 10:03:31 mail sshd[1234]: Failed password for root from 10.8.0.30"
+        "original": "2026-06-04T06:04:08+00:00 mail sshd[477802]: Invalid user root from 10.8.10.10 port 45812"
       },
       "user": { "name": "root" },
       "observer": { "source_host": "mail" },
-      "source": { "ip": "10.8.0.30" }
+      "source": { "ip": "10.8.10.10" }
     }
-
----
-
-## Output format
-
-### Brute force alert
-
-    [2026-05-29 10:03:31 UTC] [AUTOMATED_BRUTE_FORCE] severity=CRITICAL user=root
-    source_ip=10.8.0.30 target_host=mail risk=100
-    reasons=['burst_attack', 'valid_account_targeted', 'ml_anomaly_detected']
-    features={...}
-
-### Compromised account alert
-
-    [2026-05-29 10:15:44 UTC] [COMPROMISED_ACCOUNT] severity=CRITICAL user=root
-    source_ip=10.8.0.30 target_host=mail risk=100 previous_risk=85
-    failed_attempts=12 reason=successful_login_after_bruteforce
-
----
-
-## Feature set (9 features fed into the ML model)
-
-| Feature | What it measures |
-|---|---|
-| failed_attempts | Max failures across pair, user, and IP in last 5 min |
-| long_failed_attempts | Max failures across pair, user, and IP in last 60 min |
-| seconds_since_last_attempt | Time since last attempt from this IP and user |
-| source_attempt_rate | Attempts per minute from this IP |
-| source_burst_attempts | Attempts from this IP within last 1 second |
-| unique_users_targeted | Distinct usernames tried from this IP in 5 min |
-| persistence_minutes | How long this attack has been running |
-| account_risk | root=5, admin=4, mysql/postgres=3, others=1 |
-| user_validity | 1 if account exists, 0 if invalid user |
-
----
-
-## New in this version
-
-### Valid vs Invalid user classification
-
-When a log contains "invalid user" it means the attacker is guessing usernames that do not exist.
-When the username actually exists on the system ("failed password"), the risk score increases significantly
-because the attacker has found a real target.
-
-    invalid user attempt  → risk reduced  (just scanning, not targeted)
-    valid user, few fails → small boost
-    valid user, 10+ fails → +15 points
-    valid user, 20+ fails → +25 points
-
-### Successful login after brute force detection
-
-When a successful authentication is detected from an IP that was previously flagged for brute force
-activity against the same user within the last hour, a COMPROMISED_ACCOUNT alert fires immediately
-with severity CRITICAL regardless of anything else.
-
-This is the most dangerous scenario — the attack succeeded.
-
----
-
-## How the detection pipeline works
-
-    New log arrives
-         |
-    is_auth_success? --> YES --> was this user under attack in last hour?
-         |                              |
-         |                    YES --> COMPROMISED_ACCOUNT alert
-         |
-    is_auth_failure? --> NO --> skip
-         |
-    extract 9 features
-         |
-    IsolationForest predict --> normal or anomaly?
-         |
-    calculate_risk_score() --> 0 to 100 + reasons list
-         |
-    if ML anomaly and 3+ failures --> risk += 20
-         |
-    classify severity
-         |
-    detect automation --> MANUAL or AUTOMATED
-         |
-    print alert
 
 ---
 
@@ -184,7 +154,7 @@ This is the most dangerous scenario — the attack succeeded.
 
 ## Part of the IITB SOC Pipeline
 
-    Sources → Kafka → FOSS SOC Engine → Logstash → [THIS DETECTOR] → Alerts → Kibana
+    Sources -> Kafka -> FOSS SOC Engine -> Logstash -> [THIS DETECTOR] -> Alerts -> Kibana
 
 ---
 
