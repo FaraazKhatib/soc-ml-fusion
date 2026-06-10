@@ -2,8 +2,8 @@
 **IITB Trust Lab — Summer of Code 2026**
 
 Real-time ML-based brute force detection engine for mail authentication logs.
-Uses two IsolationForest models (IP-level and User-level) running in parallel
-to catch attacks that a single model cannot detect on its own.
+Uses two IsolationForest models (IP-level and User-level) running in parallel.
+Alerts print to terminal and are also written as structured JSON for Elasticsearch ingestion.
 
 ---
 
@@ -16,7 +16,7 @@ to catch attacks that a single model cannot detect on its own.
 | Credential stuffing | Automated spray using leaked password lists |
 | Distributed attack | 3+ different IPs coordinating against same user |
 | Automated botnet | 5+ IPs simultaneously targeting same user |
-| Successful compromise | Login detected after prior brute force activity |
+| Successful compromise | Login detected within 2 minutes of prior brute force |
 | Slow and low attacks | 60-minute window catches attackers who pace slowly |
 
 ---
@@ -28,13 +28,14 @@ to catch attacks that a single model cannot detect on its own.
     git clone https://github.com/FaraazKhatib/soc-ml-fusion.git
     cd soc-ml-fusion
 
-### 2. Set your log file path
+### 2. Set your paths
 
-Open ml_fusion.py and change line 20:
+Open ml_fusion.py and change lines 20-21:
 
-    AUTH_LOG_FILE = "/your/path/to/auth_logs.json"
+    AUTH_LOG_FILE  = "/your/path/to/auth_logs.json"
+    ALERTS_FILE    = "/your/path/to/bruteforce_alerts.json"
 
-That is the only change you need to make.
+Those are the only changes you need to make.
 
 ### 3. Run
 
@@ -44,8 +45,6 @@ That is the only change you need to make.
 ---
 
 ## Recommended — Run in an isolated environment
-
-If you are on a shared server or do not have sudo access:
 
     python3 -m venv freshenv
     source freshenv/bin/activate
@@ -65,27 +64,18 @@ To exit:
 
 ---
 
-## How the dual model works
+## Output — Two channels
 
-Two IsolationForest models run on every event:
+Every alert goes to both places simultaneously:
 
-    IP Model (model_ip)
-    Trained on per-source-IP features.
-    Catches: brute force, spray, credential stuffing, fast automated attacks.
-    Features: failed attempts, attempt rate, burst, CV interval, persistence, etc.
+    Terminal     Human-readable multi-line format for live monitoring.
 
-    User Model (model_user)
-    Trained on per-target-user features.
-    Catches: distributed attacks where each IP looks innocent individually
-    but the combined pressure on one account is anomalous.
-    Features: unique IPs targeting user, rate of new IPs joining, mean attempts per IP.
-
-    Final score = max(ip_score, user_score)
-    The worst-case perspective always wins.
+    ALERTS_FILE  One JSON object per line, ECS-compatible structure,
+                 ready to be ingested into Elasticsearch and visualised on Kibana.
 
 ---
 
-## Alert format
+## Terminal alert format
 
     [2026-06-04 06:04:08 UTC] [CRITICAL] [AUTOMATED]
       Who:    10.8.10.20 -> root on mail
@@ -107,15 +97,56 @@ Two IsolationForest models run on every event:
 
 ---
 
-## Identity key and alert deduplication
+## JSON alert format (bruteforce_alerts.json)
 
-Each alert is tracked by an identity key so the same attack does not spam the terminal:
+Each line in ALERTS_FILE is a JSON object structured for ECS compatibility:
 
-    3+ IPs targeting same user  ->  key = DISTRIBUTED:{user}   (one consolidated alert)
-    Single IP attack            ->  key = {source_ip}          (one alert per IP)
+    {
+      "@timestamp": "2026-06-04 06:04:08 UTC",
+      "event": {
+        "module":   "bruteforce_detector",
+        "category": "authentication",
+        "kind":     "alert",
+        "type":     ["indicator"],
+        "severity": "CRITICAL",
+        "action":   "blocked",
+        "reason":   "automated_distributed"
+      },
+      "source":   { "ip": "10.8.10.20" },
+      "user":     { "name": "root" },
+      "host":     { "name": "mail" },
+      "observer": { "name": "ml_fusion_faraaz" },
+      "tlsoc": {
+        "automated":                 true,
+        "auto_signals":              ["distributed_botnet(5_ips_targeting_same_user)"],
+        "score":                     0.87,
+        "score_ip":                  0.61,
+        "score_user":                0.87,
+        "failed_attempts":           12,
+        "source_attempt_rate":       2.4,
+        "unique_ips_targeting_user": 5,
+        "pattern":                   "automated_distributed",
+        ...
+      }
+    }
 
-Escalation still fires: a LOW alert re-fires as CRITICAL when the score crosses 0.5.
-A MANUAL alert re-fires as AUTOMATED when automation is confirmed.
+This file can be shipped to Elasticsearch via Filebeat or Logstash for Kibana dashboards.
+
+---
+
+## How the dual model works
+
+    IP Model (model_ip)
+    Trained on 11 per-source-IP features.
+    Catches: brute force, spray, credential stuffing, fast automated attacks.
+
+    User Model (model_user)
+    Trained on 7 per-target-user features.
+    Catches: distributed attacks where each individual IP looks innocent
+    but the combined pressure on one account is anomalous.
+
+    Final score = max(ip_score, user_score)
+    The worst-case perspective always wins.
 
 ---
 
@@ -123,21 +154,48 @@ A MANUAL alert re-fires as AUTOMATED when automation is confirmed.
 
     CV consistency     CV = std_dev / mean of inter-attempt gaps.
                        CV near 0 means perfectly regular timing = tool.
-                       Works for Hydra --wait N regardless of speed.
+                       Catches Hydra --wait N regardless of speed.
 
-    Speed signals      Sub-0.5s gaps, rate > 4/min, or 3+ attempts in 1 second.
-                       Requires 2 signals to avoid false positives.
+    Speed signals      Sub-0.5s gaps, rate > 4/min, or 3+ attempts in 1s.
+                       Requires 2 of 3 signals to avoid false positives.
 
     Distributed botnet 5+ coordinated IPs against same user.
-                       A human cannot operate 5 machines simultaneously.
+                       Requires user_failed_attempts >= 5 as confirmation.
+
+Once an IP or user key is confirmed automated it is locked in memory for 1 hour.
 
 ---
 
-## Event detection
+## Alert deduplication
 
-Uses structured event fields (event_action, event_outcome) when available,
-with raw message text as fallback. Only processes login events — cron jobs,
-session opens, and privilege escalations are ignored.
+Each attack is tracked by an identity key:
+
+    3+ IPs targeting same user  ->  DISTRIBUTED:{user}  (one consolidated alert)
+    Single IP attack            ->  {source_ip}         (one alert per IP)
+
+Escalation paths that re-fire:
+    LOW  -> CRITICAL when score crosses 0.5
+    MANUAL -> AUTOMATED when automation is later confirmed
+
+---
+
+## Compromised account detection
+
+A COMPROMISED ACCOUNT alert fires when:
+    1. A successful login is detected from an IP
+    2. That same IP attacked that same user in the last 2 minutes
+    3. The prior attack had at least 3 failed attempts
+
+The 2-minute window is tight by design to avoid false positives from
+legitimate users who failed their own password multiple times.
+
+---
+
+## Event filtering
+
+Only processes events where event_action == "login".
+CRON jobs, session opens, PAM events, and privilege escalations are ignored.
+Events with no source IP are skipped.
 
 ---
 
@@ -145,6 +203,7 @@ session opens, and privilege escalations are ignored.
 
 - Python 3.8 or higher
 - Log file in newline-delimited JSON format (one JSON object per line)
+- Write access to ALERTS_FILE directory
 
 ---
 
@@ -154,12 +213,12 @@ session opens, and privilege escalations are ignored.
       "@timestamp": "2026-06-04T06:04:08Z",
       "event": {
         "original": "2026-06-04T06:04:08+00:00 mail sshd[477802]: Invalid user root from 10.8.10.10",
-        "action": "login",
-        "outcome": "failure"
+        "action":   "login",
+        "outcome":  "failure"
       },
-      "user": { "name": "root" },
+      "user":     { "name": "root" },
       "observer": { "source_host": "mail" },
-      "source": { "ip": "10.8.10.10" }
+      "source":   { "ip": "10.8.10.10" }
     }
 
 ---
@@ -167,7 +226,7 @@ session opens, and privilege escalations are ignored.
 ## Project structure
 
     soc-ml-fusion/
-    ├── ml_fusion.py          — main detection engine (dual model)
+    ├── ml_fusion.py          — main detection engine
     ├── run.sh                — setup and run script
     ├── requirements.txt      — Python dependencies
     ├── core/                 — shared core modules
@@ -179,7 +238,7 @@ session opens, and privilege escalations are ignored.
 
 ## Part of the IITB SOC Pipeline
 
-    Sources -> Kafka -> FOSS SOC Engine -> Logstash -> [THIS DETECTOR] -> Alerts -> Kibana
+    Sources -> Kafka -> FOSS SOC Engine -> Logstash -> [THIS DETECTOR] -> bruteforce_alerts.json -> Elasticsearch -> Kibana
 
 ---
 

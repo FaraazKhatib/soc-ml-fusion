@@ -15,7 +15,8 @@ from sklearn.ensemble import IsolationForest
 # CONFIG
 # =====================================================
 
-AUTH_LOG_FILE = "/var/log/soc_output/mail_auth.json"
+AUTH_LOG_FILE   = "/var/log/soc_output/mail_auth.json"
+ALERTS_FILE     = "/var/log/soc_output/bruteforce_alerts.json"
 
 SHORT_WINDOW_MINUTES = 5
 LONG_WINDOW_MINUTES  = 60
@@ -110,6 +111,103 @@ def log_print(msg):
     print(msg, flush=True)
 
 
+def write_alert_json(timestamp, severity, automated, auto_sigs,
+                     source_ip, user, host, score, score_ip, score_user,
+                     pattern, ip_feats, unique_ips_for_user):
+    alert_doc = {
+        "@timestamp": timestamp,
+        "event": {
+            "module":   "bruteforce_detector",
+            "category": "authentication",
+            "kind":     "alert",
+            "type":     ["indicator"],
+            "severity": severity,
+            "action":   "blocked" if severity == "CRITICAL" else "observed",
+            "reason":   pattern,
+        },
+        "source": {
+            "ip": source_ip,
+        },
+        "user": {
+            "name": user,
+        },
+        "host": {
+            "name": host,
+        },
+        "observer": {
+            "name": "ml_fusion_faraaz",
+        },
+        "tlsoc": {
+            "automated":                 automated,
+            "auto_signals":              auto_sigs,
+            "score":                     score,
+            "score_ip":                  score_ip,
+            "score_user":                score_user,
+            "failed_attempts":           ip_feats["failed_attempts"],
+            "pair_failed_attempts":      ip_feats["pair_failed_attempts"],
+            "user_failed_attempts":      ip_feats["user_failed_attempts"],
+            "ip_failed_attempts":        ip_feats["ip_failed_attempts"],
+            "long_failed_attempts":      ip_feats["long_failed_attempts"],
+            "source_attempt_rate":       ip_feats["source_attempt_rate"],
+            "source_burst_attempts":     ip_feats["source_burst_attempts"],
+            "unique_users_targeted":     ip_feats["unique_users_targeted"],
+            "unique_ips_targeting_user": unique_ips_for_user,
+            "persistence_minutes":       ip_feats["persistence_minutes"],
+            "account_risk":              ip_feats["account_risk"],
+            "user_validity":             ip_feats["user_validity"],
+            "interval_cv":               ip_feats["interval_cv"],
+            "pattern":                   pattern,
+        },
+    }
+
+    try:
+        with open(ALERTS_FILE, "a") as f:
+            f.write(json.dumps(alert_doc) + "\n")
+    except Exception:
+        pass
+
+
+def write_compromised_json(timestamp, user, source_ip, host,
+                           failed_attempts, anomaly_score, severity,
+                           all_ips_for_user):
+    alert_doc = {
+        "@timestamp": timestamp,
+        "event": {
+            "module":   "bruteforce_detector",
+            "category": "authentication",
+            "kind":     "alert",
+            "type":     ["indicator"],
+            "severity": "CRITICAL",
+            "action":   "blocked",
+            "reason":   "compromised_account",
+        },
+        "source": {
+            "ip": source_ip,
+        },
+        "user": {
+            "name": user,
+        },
+        "host": {
+            "name": host,
+        },
+        "observer": {
+            "name": "ml_fusion_faraaz",
+        },
+        "tlsoc": {
+            "prior_failed_attempts": failed_attempts,
+            "prior_anomaly_score":   anomaly_score,
+            "prior_severity":        severity,
+            "other_ips_for_user":    all_ips_for_user,
+        },
+    }
+
+    try:
+        with open(ALERTS_FILE, "a") as f:
+            f.write(json.dumps(alert_doc) + "\n")
+    except Exception:
+        pass
+
+
 def print_alert(timestamp, severity, auto_tag, automated, auto_sigs,
                 source_ip, user, host, score, score_ip, score_user,
                 pattern, ip_feats, unique_ips_for_user,
@@ -170,6 +268,22 @@ def print_alert(timestamp, severity, auto_tag, automated, auto_sigs,
 
     print("\n".join(lines), flush=True)
 
+    write_alert_json(
+        timestamp=timestamp,
+        severity=severity,
+        automated=automated,
+        auto_sigs=auto_sigs,
+        source_ip=source_ip,
+        user=user,
+        host=host,
+        score=score,
+        score_ip=score_ip,
+        score_user=score_user,
+        pattern=pattern,
+        ip_feats=ip_feats,
+        unique_ips_for_user=unique_ips_for_user,
+    )
+
 
 def print_compromised(timestamp, user, source_ip, host,
                       failed_attempts, anomaly_score, severity,
@@ -185,6 +299,17 @@ def print_compromised(timestamp, user, source_ip, host,
     if len(all_ips_for_user) > 1:
         lines.append(f"  Other IPs that targeted this account: {', '.join(all_ips_for_user)}")
     print("\n".join(lines), flush=True)
+
+    write_compromised_json(
+        timestamp=timestamp,
+        user=user,
+        source_ip=source_ip,
+        host=host,
+        failed_attempts=failed_attempts,
+        anomaly_score=anomaly_score,
+        severity=severity,
+        all_ips_for_user=all_ips_for_user,
+    )
 
 
 def extract_real_event_timestamp(log):
@@ -281,14 +406,12 @@ def normalize_log(log):
 # =====================================================
 
 def is_auth_failure(log):
-    # Prefer structured fields
     if (
         log.get("event_action") == "login"
         and log.get("event_outcome") == "failure"
     ):
         return True
 
-    # Fallback on raw log text for robustness
     msg = log["raw_message"]
     return (
         "failed password"        in msg or
@@ -313,12 +436,6 @@ def is_auth_success(log):
 
 
 def detect_success_after_bruteforce(log):
-    """
-    Only mark as COMPROMISED if:
-    - this user had a recent attack record, and
-    - the success comes from the same IP, and
-    - the last failed attempt was very recent.
-    """
     user      = log["user"]
     source_ip = log["source_ip"]
 
@@ -327,11 +444,9 @@ def detect_success_after_bruteforce(log):
 
     attack = recent_attack_activity[user]
 
-    # Must be same IP as the attack
     if attack["source_ip"] != source_ip:
         return None
 
-    # Success must be close in time to last attack, e.g. within 2 minutes
     delta = (log["timestamp"] - attack["timestamp"]).total_seconds()
     if delta > 120:
         return None
@@ -577,7 +692,6 @@ def detect_automation(features, unique_ips_for_user):
         signals.append(f"regular_interval(cv={features['interval_cv']})")
 
     speed_signals = 0
-    # Slightly stricter: treat as automated only if really tight gaps
     if features.get("ip_seconds_since_last_attempt", 300.0) < 0.5:
         speed_signals += 1
         signals.append(
@@ -666,7 +780,6 @@ def train_model():
         if log is None:
             continue
 
-        # Brute-force module only trains on login events
         if log.get("event_action") != "login":
             continue
 
@@ -720,11 +833,9 @@ def process_log(raw_log):
     if log is None:
         return
 
-    # For v1, brute-force only: ignore non-login events (cron, session, elevation)
     if log.get("event_action") != "login":
         return
 
-    # Optionally: ignore events without a real source IP
     if log.get("source_ip") in (None, "unknown"):
         return
 
