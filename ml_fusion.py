@@ -264,12 +264,15 @@ def normalize_log(log):
         return None
 
     return {
-        "timestamp":    timestamp,
-        "user":         user.get("name", "unknown"),
-        "host":         observer.get("source_host", "unknown"),
-        "source_ip":    source.get("ip", "unknown"),
-        "raw_message":  message,
-        "invalid_user": invalid_user,
+        "timestamp":      timestamp,
+        "user":           user.get("name", "unknown"),
+        "host":           observer.get("source_host", "unknown"),
+        "source_ip":      source.get("ip", "unknown"),
+        "raw_message":    message,
+        "invalid_user":   invalid_user,
+        "event_outcome":  event.get("outcome"),
+        "event_action":   event.get("action"),
+        "event_category": event.get("category"),
     }
 
 
@@ -278,6 +281,14 @@ def normalize_log(log):
 # =====================================================
 
 def is_auth_failure(log):
+    # Prefer structured fields
+    if (
+        log.get("event_action") == "login"
+        and log.get("event_outcome") == "failure"
+    ):
+        return True
+
+    # Fallback on raw log text for robustness
     msg = log["raw_message"]
     return (
         "failed password"        in msg or
@@ -287,6 +298,12 @@ def is_auth_failure(log):
 
 
 def is_auth_success(log):
+    if (
+        log.get("event_action") == "login"
+        and log.get("event_outcome") == "success"
+    ):
+        return True
+
     msg = log["raw_message"]
     return (
         "accepted password"        in msg or
@@ -296,15 +313,27 @@ def is_auth_success(log):
 
 
 def detect_success_after_bruteforce(log):
-    user = log["user"]
+    """
+    Only mark as COMPROMISED if:
+    - this user had a recent attack record, and
+    - the success comes from the same IP, and
+    - the last failed attempt was very recent.
+    """
+    user      = log["user"]
+    source_ip = log["source_ip"]
 
     if user not in recent_attack_activity:
         return None
 
     attack = recent_attack_activity[user]
-    delta  = (log["timestamp"] - attack["timestamp"]).total_seconds()
 
-    if delta > 3600:
+    # Must be same IP as the attack
+    if attack["source_ip"] != source_ip:
+        return None
+
+    # Success must be close in time to last attack, e.g. within 2 minutes
+    delta = (log["timestamp"] - attack["timestamp"]).total_seconds()
+    if delta > 120:
         return None
 
     if attack["failed_attempts"] < 3:
@@ -548,15 +577,16 @@ def detect_automation(features, unique_ips_for_user):
         signals.append(f"regular_interval(cv={features['interval_cv']})")
 
     speed_signals = 0
-    if features.get("ip_seconds_since_last_attempt", 300.0) < 1.0:
+    # Slightly stricter: treat as automated only if really tight gaps
+    if features.get("ip_seconds_since_last_attempt", 300.0) < 0.5:
         speed_signals += 1
         signals.append(
             f"sub_second_gap({features['ip_seconds_since_last_attempt']}s)"
         )
-    if features["source_attempt_rate"] > 3:
+    if features["source_attempt_rate"] > 4:
         speed_signals += 1
         signals.append(f"high_rate({features['source_attempt_rate']}/min)")
-    if features["source_burst_attempts"] >= 2:
+    if features["source_burst_attempts"] >= 3:
         speed_signals += 1
         signals.append(f"burst({features['source_burst_attempts']}_in_1s)")
 
@@ -635,6 +665,11 @@ def train_model():
         log = normalize_log(raw_log)
         if log is None:
             continue
+
+        # Brute-force module only trains on login events
+        if log.get("event_action") != "login":
+            continue
+
         if is_auth_failure(log):
             auth_logs.append(log)
 
@@ -683,6 +718,14 @@ def train_model():
 def process_log(raw_log):
     log = normalize_log(raw_log)
     if log is None:
+        return
+
+    # For v1, brute-force only: ignore non-login events (cron, session, elevation)
+    if log.get("event_action") != "login":
+        return
+
+    # Optionally: ignore events without a real source IP
+    if log.get("source_ip") in (None, "unknown"):
         return
 
     cleanup_old_alerts(log["timestamp"])
